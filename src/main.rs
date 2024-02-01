@@ -1,18 +1,22 @@
-use std::borrow::Cow;
+use egui::{Color32, Context, Visuals};
+use egui_wgpu::renderer::ScreenDescriptor;
+use wgpu::{Backends, Color, InstanceDescriptor, LoadOp, StoreOp};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
     window::Window,
 };
+use winit::event_loop::ControlFlow;
 
 async fn run(event_loop: EventLoop<()>, window: Window) {
     let mut size = window.inner_size();
     size.width = size.width.max(1);
     size.height = size.height.max(1);
 
-    let instance = wgpu::Instance::default();
+    let instance = wgpu::Instance::new(InstanceDescriptor { backends: Backends::PRIMARY, ..Default::default() });
 
-    let surface = instance.create_surface(&window).unwrap();
+    let surface = unsafe { instance.create_surface(&window) }.unwrap();
+
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
@@ -28,9 +32,9 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
+                features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(adapter.limits()),
             },
             None,
@@ -38,38 +42,10 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .await
         .expect("Failed to create device");
 
-    // Load the shaders from disk
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
-    });
-
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[],
         push_constant_ranges: &[],
-    });
-
-    let swapchain_capabilities = surface.get_capabilities(&adapter);
-    let swapchain_format = swapchain_capabilities.formats[0];
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None,
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(swapchain_format.into())],
-        }),
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
     });
 
     let mut config = surface
@@ -77,99 +53,160 @@ async fn run(event_loop: EventLoop<()>, window: Window) {
         .unwrap();
     surface.configure(&device, &config);
 
-    let window = &window;
+    // Egui stuff
+    let context = Context::default();
+    let mut winit_state = egui_winit::State::new(context.viewport_id(), &window, Some(window.scale_factor() as f32), None);
+
+    let mut egui_renderer = egui_wgpu::Renderer::new(
+        &device,
+        config.format,
+        None,
+        1,
+    );
+
+    let mut screen_descriptor = ScreenDescriptor {
+        pixels_per_point: window.scale_factor() as f32,
+        size_in_pixels: [window.inner_size().width, window.inner_size().height],
+    };
+
+    let window = Box::leak(Box::new(window));
+
+    let mut first_resize_happened = cfg!(not(target_os = "windows"));
+
     event_loop
-        .run(move |event, target| {
+        .run(move |event, target, control_flow| {
             // Have the closure take ownership of the resources.
             // `event_loop.run` never returns, therefore we must do this to ensure
             // the resources are properly cleaned up.
-            let _ = (&instance, &adapter, &shader, &pipeline_layout);
+            let _ = (&instance, &adapter, &pipeline_layout);
 
-            if let Event::WindowEvent {
-                window_id: _,
-                event,
-            } = event
-            {
-                match event {
-                    WindowEvent::Resized(new_size) => {
-                        // Reconfigure the surface with the new size
-                        config.width = new_size.width.max(1);
-                        config.height = new_size.height.max(1);
-                        surface.configure(&device, &config);
-                        // On macos the window needs to be redrawn manually after resizing
-                        window.request_redraw();
-                    }
-                    WindowEvent::RedrawRequested => {
-                        let frame = surface
-                            .get_current_texture()
-                            .expect("Failed to acquire next swap chain texture");
-                        let view = frame
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: None,
-                            });
-                        {
-                            let mut rpass =
-                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: None,
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Clear(wgpu::Color::GREEN),
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    timestamp_writes: None,
-                                    occlusion_query_set: None,
-                                });
-                            rpass.set_pipeline(&render_pipeline);
-                            rpass.draw(0..3, 0..1);
+            match event {
+                Event::RedrawRequested(_) => {
+                    // egui
+                    let raw_input = winit_state.take_egui_input(&window);
+                    context.begin_frame(raw_input);
+                    context.set_visuals(Visuals {
+                        window_fill: Color32::TRANSPARENT,
+                        panel_fill: Color32::TRANSPARENT,
+                        override_text_color: Some(Color32::RED),
+                        faint_bg_color: Color32::RED,
+                        extreme_bg_color: Color32::BLUE,
+                        ..Default::default()
+                    });
+                    egui::CentralPanel::default().show(&context, |ui| {
+                        ui.label("Hello world".to_owned());
+
+                        ui.scope(|ui| {
+                            ui.button("aaa");
+                        });
+
+                        if ui.button("Click me").clicked() {
+                            println!("Clicked");
                         }
+                    });
+                    let output = context.end_frame();
 
-                        queue.submit(Some(encoder.finish()));
-                        frame.present();
+
+                    let frame = surface
+                        .get_current_texture()
+                        .expect("Failed to acquire next swap chain texture");
+                    let view = frame
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: None,
+                        });
+
+                    // prepare egui frame
+                    let paint_jobs = context
+                        .tessellate(output.shapes, output.pixels_per_point);
+                    let tdelta = output.textures_delta;
+
+                    for (t_id, tdelta) in tdelta.set {
+                        egui_renderer
+                            .update_texture(&device, &queue, t_id, &tdelta);
                     }
-                    WindowEvent::CloseRequested => target.exit(),
-                    _ => {}
-                };
+
+                    egui_renderer.update_buffers(
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        &paint_jobs,
+                        &screen_descriptor,
+                    );
+
+                    {
+                        let mut egui_render_pass = encoder
+                            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: None,
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    ops: wgpu::Operations {
+                                        load: LoadOp::Clear(Color::TRANSPARENT),
+                                        store: StoreOp::Store,
+                                    },
+                                    resolve_target: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                occlusion_query_set: None,
+                                timestamp_writes: None,
+                            });
+
+                        egui_renderer
+                            .render(&mut egui_render_pass, &paint_jobs, &screen_descriptor);
+                    }
+
+                    queue.submit(Some(encoder.finish()));
+                    frame.present();
+                }
+
+                Event::WindowEvent {
+                    event: window_event, window_id: _
+                } => {
+                    match window_event {
+                        WindowEvent::Resized(new_size) => {
+                            if !first_resize_happened {
+                                first_resize_happened = true;
+                                return;
+                            }
+                            // egui resize
+                            screen_descriptor.size_in_pixels = [new_size.width, new_size.height];
+                            screen_descriptor.pixels_per_point = egui_winit::pixels_per_point(&context, &window);
+
+                            // Reconfigure the surface with the new size
+                            config.width = new_size.width.max(1);
+                            config.height = new_size.height.max(1);
+                            surface.configure(&device, &config);
+                            // On macos the window needs to be redrawn manually after resizing
+                            window.request_redraw();
+                        }
+                        WindowEvent::CloseRequested => {
+                            *control_flow = ControlFlow::ExitWithCode(0);
+                        }
+                        other => {
+                            let result =
+                                winit_state
+                                    .on_window_event(&context, &other);
+                            if result.repaint {
+                                window.request_redraw();
+                            }
+                        }
+                    };
+                }
+                _ => {}
             }
-        })
-        .unwrap();
+        });
 }
 
 pub fn main() {
-    let event_loop = EventLoop::new().unwrap();
-    #[allow(unused_mut)]
-    let mut builder = winit::window::WindowBuilder::new();
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsCast;
-        use winit::platform::web::WindowBuilderExtWebSys;
-        let canvas = web_sys::window()
-            .unwrap()
-            .document()
-            .unwrap()
-            .get_element_by_id("canvas")
-            .unwrap()
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .unwrap();
-        builder = builder.with_canvas(Some(canvas));
-    }
-    let window = builder.build(&event_loop).unwrap();
+    env_logger::init();
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        env_logger::init();
-        pollster::block_on(run(event_loop, window));
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-        console_log::init().expect("could not initialize logger");
-        wasm_bindgen_futures::spawn_local(run(event_loop, window));
-    }
+    let event_loop = EventLoop::new();
+    let window = winit::window::WindowBuilder::new()
+        .with_transparent(true)
+        .build(&event_loop)
+        .unwrap();
+
+    pollster::block_on(run(event_loop, window));
 }
